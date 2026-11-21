@@ -108,18 +108,29 @@ $('post').onclick=()=>{if(!pending)return;const {s,d,changes}=pending;if(changes
  next.reports={...dayReports,[s+'-'+d]:changes.map(x=>x.a[0])};try{edits=next;dayReports=next.reports;draw();cancel();$('notice').textContent='ลงยอด SALE วันที่ '+(d+1)+' พ.ย. แล้ว พร้อมส่งออก Excel'}catch{$('notice').textContent='พื้นที่จัดเก็บไม่พอ ยังไม่ได้ลงยอด'}};
 context();
 
+let saveBatch;
 if(true){
  let revision=0;
  const main=document.querySelector('main');
  function applyState(a){edits=a.edits;recipeBook=a.recipes;dayReports=edits.reports||{};revision=a.rev;groups();context()}
+
+ saveBatch=async change=>{
+  const before=structuredClone(edits);
+  try{
+   change();
+   const response=await api('/api/state',{method:'POST',headers:{'Content-Type':'application/json','X-Bar-App':'daily'},body:JSON.stringify({edits,recipes:recipeBook,rev:revision})});
+   if(!response.ok)throw Error('บันทึกไม่สำเร็จ กรุณาโหลดหน้าใหม่เพื่อตรวจข้อมูลล่าสุด');
+   revision=(await response.json()).rev;draw();renderBatches();
+  }catch(e){edits=before;dayReports=edits.reports||{};renderBatches();throw e}
+ };
  async function getState(){const res=await api('/api/state');if(!res.ok)throw Error();return res.json()}
  main.inert=true;
- getState().then(a=>{applyState(a);main.inert=false;$('status').textContent='เปิดฐานข้อมูลกลางแล้ว'}).catch(()=>{$('status').textContent='เปิดฐานข้อมูลไม่ได้ กรุณาโหลดหน้าใหม่'});
+ getState().then(a=>{applyState(a);renderBatches();main.inert=false;$('status').textContent='เปิดฐานข้อมูลกลางแล้ว'}).catch(()=>{$('status').textContent='เปิดฐานข้อมูลไม่ได้ กรุณาโหลดหน้าใหม่'});
  for(const [el,event] of [['rows','onchange'],['post','onclick'],['storeRecipes','onclick']]){
  const handler=$(el)[event];$(el)[event]=async function(e){
  const previous=JSON.stringify([edits,recipeBook]);handler.call(this,e);if(previous===JSON.stringify([edits,recipeBook]))return;
  main.inert=true;try{const response=await api('/api/state',{method:'POST',headers:{'Content-Type':'application/json','X-Bar-App':'daily'},body:JSON.stringify({edits,recipes:recipeBook,rev:revision})});
- if(!response.ok)throw Error();revision=(await response.json()).rev;$('status').textContent='บันทึกฐานข้อมูลหลักแล้ว';main.inert=false}
+ if(!response.ok)throw Error();revision=(await response.json()).rev;renderBatches();$('status').textContent='บันทึกฐานข้อมูลหลักแล้ว';main.inert=false}
  catch{$('notice').textContent='ยืนยันการบันทึกไม่ได้ กรุณาโหลดหน้าใหม่และตรวจรายงาน';$('status').textContent='ยืนยันการบันทึกไม่ได้ กรุณาโหลดหน้าใหม่เพื่อตรวจยอดล่าสุด';alert($('status').textContent)}
  }}
 }
@@ -187,3 +198,175 @@ $('approve').onclick=async()=>{
    $('catalogStatus').textContent=$('status').textContent+' · '+$('recipeNotice').textContent;
  } catch(error){$('catalogStatus').textContent=error.message}
 };
+
+// POS019 detail columns in PDF points. Reconcile the full detail Qty against the report total.
+async function readPOS019(document) {
+ const lines=[], outlets=new Set(), notes=[];
+ let outlet='', category='', date='', grand=null, total=0, last=null, end=false;
+ const months='Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ');
+ for(let page=1;page<=document.numPages;page++){
+  const content=await (await document.getPage(page)).getTextContent();
+  const rows=new Map();
+  for(const t of content.items){
+   if(!t.str?.trim()||t.transform[5]<36)continue;
+   const y=Math.round(t.transform[5]);if(!rows.has(y))rows.set(y,[]);
+   rows.get(y).push({x:t.transform[4],v:t.str.trim()});
+  }
+  for(const [,cells] of [...rows].sort((a,b)=>b[0]-a[0])){
+   cells.sort((a,b)=>a.x-b.x);
+   const first=cells[0].v, field=(lo,hi)=>cells.filter(c=>c.x>=lo&&c.x<hi).map(c=>c.v).join(' ');
+   const stamp=/^\((\d{1,2}) ([A-Z][a-z]{2}), (\d{4})\)$/.exec(first);
+   if(stamp){const parsed=[stamp[3],String(months.indexOf(stamp[2])+1).padStart(2,'0'),stamp[1].padStart(2,'0')].join('-');if(date&&date!==parsed)throw Error('รายงานมีหลายวันที่');date=parsed}
+   if(first.startsWith('Outlet: ')){outlet=first.slice(8).trim();outlets.add(outlet)}
+   if(first.startsWith('Category: '))category=first.slice(10).trim();
+   if(first.includes('END OF REPORT'))end=true;
+   if(first==='Total:')grand=Number(field(530,590).replaceAll(',',''));
+   if(/^\d+-\d+-\d+$/.test(first)||(first==="TIPS"&&field(530,590))){
+    const raw=field(530,590).replaceAll(',','');if(!outlet||!/^[-+]?\d+(\.\d+)?$/.test(raw))throw Error('อ่าน Qty ไม่ได้ หน้า '+page+' '+first);
+    const quantity=Number(raw); total+=quantity;
+    const dept=field(260,335);
+    if(/alcohol|beer|wine/i.test(dept)||/add extra|mini bar|beverage|coffee|tea|juice|shake|smoothie|cocktail/i.test(category)){
+     last={outlet,code:first,menu:field(165,215),quantity,page,category};lines.push(last);
+    }else{last=null;if(!/FOOD|Spa Massage|MISCELLANEOUS|TIPS/i.test(dept))notes.push('ตรวจหมวด '+category+' '+first)}
+   }else if(last&&cells.every(c=>c.x>=165&&c.x<215)){last.menu+=' '+field(165,215)}
+   else if(!(last&&first.startsWith('Check Type:')))last=null;
+  }
+ }
+ if(!date||!end||grand===null||Math.abs(total-grand)>0.001||!lines.length)throw Error('อ่าน POS019 ไม่ครบ '+[date,end,grand,total,lines.length,JSON.stringify(notes)]);
+ return {date,outlets:[...outlets],lines,notes,grand,total};
+}
+
+async function loadPdfEngine(){
+ const url=typeof offlinePDF==='undefined'||offlinePDF===null?'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/pdf.min.mjs':offlinePDF.module;
+ const pdf=await import(url);
+ pdf.GlobalWorkerOptions.workerSrc=typeof offlinePDF==='undefined'||offlinePDF===null?'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/pdf.worker.min.mjs':offlinePDF.worker;
+ return pdf;
+}
+
+const barNames=['Banquet','The Taste','Mangrove'];
+const panel=document.createElement('section');
+panel.className='panel';
+$('salesFile').closest('.panel').after(panel);
+const batchView=document.createElement('div');
+const batchMessage=document.createElement('p');
+batchMessage.setAttribute('role','status');
+const batchSelect=document.createElement('select');
+batchSelect.setAttribute('aria-label','รายงาน POS019 ที่นำเข้า');
+panel.append(Object.assign(document.createElement('h2'),{textContent:'รายงาน POS019 แยกตามจุดขาย'}),batchSelect,batchView,batchMessage);
+let selectedBatch='';
+function action(label,run){
+ const button=document.createElement('button');button.textContent=label;
+ button.onclick=async()=>{try{await run()}catch(e){batchMessage.textContent=e.message}};
+ return button;
+}
+function saleLines(batch,source){return batch.lines.filter(row=>row.outlet===source)}
+function destination(batch,outlet){
+ const exact=barNames.findIndex(name=>canon(name)===canon(outlet));
+ return batch.routes?.[outlet]??exact;
+}
+function inspectBatch(batch,s){
+ const rows=batch.lines.filter(line=>destination(batch,line.outlet)===s);
+ const missing=new Set(),ready=recipeBook[s]?resolveRecipes(s,recipeBook[s]):new Map();
+ for(const line of rows){
+  if(!ready.has(canon(line.code))&&!ready.has(canon(line.menu)))missing.add(line.menu);
+  if(!Number.isFinite(line.quantity)||line.quantity<0)missing.add(line.menu+' (ตรวจ Qty)');
+ }
+ const sales=rows.map(row=>[ready.has(canon(row.code))?row.code:row.menu,row.quantity].map(csvField).join(',')).join('\n');
+ return {rows,missing,sales,result:rows.length&&!missing.size?usage(s,recipeBook[s],sales):null};
+}
+function renderBatches(){
+ const batches=edits.pos019||{};
+ batchSelect.replaceChildren(...Object.keys(batches).sort().reverse().map(date=>new Option(date,date)));
+ batchSelect.hidden=!batchSelect.length;
+ if(batches[selectedBatch])batchSelect.value=selectedBatch;
+ selectedBatch=batchSelect.value;const batch=batches[selectedBatch];batchView.replaceChildren();
+ if(!batch){batchView.textContent='เลือกรายงาน PDF เพื่อดูยอดและสูตรที่ต้องตรวจ';return}
+ const paragraph=(container,t)=>container.append(Object.assign(document.createElement('p'),{textContent:t}));
+ paragraph(batchView,batch.file+' · '+batch.date+' · Qty ทั้งรายงาน '+fmt(batch.total));
+ for(const note of batch.notes)paragraph(batchView,note);
+ for(const outlet of batch.outlets){
+  const rows=saleLines(batch,outlet),block=document.createElement('details');
+  block.append(Object.assign(document.createElement('summary'),{textContent:outlet+' · Qty ที่ต้องตรวจสำหรับพาร์ '+fmt(rows.reduce((n,r)=>n+r.quantity,0))}));
+  if(rows.length){
+   const select=document.createElement('select');select.add(new Option('รอระบุบาร์ที่จ่ายของ','-1'));
+   barNames.forEach((name,i)=>select.add(new Option(name,String(i))));
+   const old=destination(batch,outlet);select.value=String(old);
+   select.disabled=Boolean(batch.locked?.includes(outlet));
+   select.onchange=async()=>{const n=Number(select.value);try{
+    
+    await saveBatch(()=>{batch.routes[outlet]=n;delete batch.posted[n]});
+   }catch(e){batchMessage.textContent=e.message;renderBatches()}};
+   block.append(select);
+   const grouped=new Map();for(const r of rows){const k=r.code+' · '+r.menu;grouped.set(k,(grouped.get(k)||0)+r.quantity)}
+   for(const [k,n] of grouped){
+    const menu=k.slice(k.indexOf(' · ')+3);
+    const matches=catalog.recipes.filter(r=>canon(r.menu)===canon(menu));
+    if(matches.length!==1){paragraph(block,k+' × '+fmt(n));continue}
+    const item=document.createElement('details');
+    item.append(Object.assign(document.createElement('summary'),{textContent:k+' × '+fmt(n)+' · ดูปริมาณตามสูตร MC'}));
+    try{for(const line of expandRecipe(matches[0]))paragraph(item,line.description+' · '+fmt(n*line.amount)+' '+line.unit)}
+    catch(e){paragraph(item,e.message)}
+    block.append(item);
+   }
+  }else paragraph(block,'ไม่มีบรรทัดเครื่องดื่มหรือรายการที่ต้องตรวจสำหรับพาร์');
+  batchView.append(block);
+ }
+ for(const [s,name] of barNames.entries()){
+  const check=inspectBatch(batch,s);if(!check.rows.length)continue;
+  if(batch.posted?.[s]){paragraph(batchView,name+' · ลงยอดแล้ว');continue}
+  if(check.missing.size){paragraph(batchView,name+' · รอยืนยันสูตรหรือ Qty — '+[...check.missing].join(', '));continue}
+  paragraph(batchView,name+' · พร้อมลง '+check.result.total.size+' รายการวัตถุดิบ');
+  batchView.append(action('ตรวจและลงยอด '+name,async()=>{
+   const main=document.querySelector('main'); main.inert=true;
+   try{
+    const d=Number(batch.date.slice(-2))-1;
+    const original=batch.lines.filter(l=>destination(batch,l.outlet)===s);
+    const response=await api('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({original:JSON.stringify(original),day:d+1,outlet:name,sales:check.sales,recipes:recipeBook[s],usage:[...check.result.total].map(([a,n])=>({article:a[1],amount:n}))})});
+    const audit=await response.json();if(!response.ok)throw Error(audit.error||'ตรวจยอดไม่สำเร็จ');
+    if(!confirm([name+' • '+batch.date,...batch.notes,...audit.issues,...[...check.result.total].map(([a,n])=>a[2]+' = '+fmt(n)),'ยืนยันแทนยอด SALE รายการที่แสดงและล้างรายการเดิมจากรายงานก่อนหน้าที่หายไป?'].join('\n')))return;
+    await saveBatch(()=>{
+     const totals=new Map(check.result.total),key=s+'-'+d;
+     for(const row of dayReports[key]||[]){const a=stock[s].find(a=>a[0]===row);if(a&&!totals.has(a))totals.set(a,0)}
+     edits[s]??={};for(const [a,n] of totals)edits[s][col(11+d*6)+a[0]]=Number(n.toFixed(6));
+     dayReports[key]=[...totals.keys()].map(a=>a[0]);edits.reports=dayReports;
+     edits.imports??={};edits.imports[key]={hash:batch.hash,file:batch.file,sales:check.sales,review:[...batch.notes,...audit.issues],at:new Date().toISOString()};
+     batch.posted[s]=true;batch.locked=[...new Set([...(batch.locked||[]),...original.map(r=>r.outlet)])];
+    });
+   }finally{main.inert=false}
+  }));
+ }
+ batchView.append(action('ส่งออกยอด Qty ทุกจุดขาย (CSV)',()=>{
+  const rows=[['วันที่','จุดขาย','บาร์ที่จ่าย','POS Code','เมนู','Qty','หน้า PDF'],...batch.lines.map(r=>[batch.date,r.outlet,barNames[destination(batch,r.outlet)]||'รอระบุ',r.code,r.menu,r.quantity,r.page])];
+  const blob=new Blob(['\uFEFF'+rows.map(row=>row.map(v=>csvField(typeof v==='string'&&/^\s*[=+@-]/.test(v)?"'"+v:v)).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='POS019_'+batch.date+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+ }));
+}
+batchSelect.onchange=()=>{selectedBatch=batchSelect.value;renderBatches()};
+const oldUpload=$('salesFile').onchange;
+$('salesFile').onchange=async function(e){
+ const file=this.files[0];if(!file||!file.name.toLowerCase().endsWith('.pdf'))return oldUpload.call(this,e);
+ const main=document.querySelector('main');main.inert=true;cancel();sourceInfo=null;$('sales').value='';
+ try{
+  if(file.size>8*1024*1024)throw Error('ไฟล์เกิน 8 MB');
+  batchMessage.textContent='กำลังแยกรายการและตรวจยอดท้ายรายงาน…';
+  const bytes=await file.arrayBuffer(),hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
+  const prior=Object.values(edits.pos019||{}).find(b=>b.hash===hash);
+  if(prior){selectedBatch=prior.date;renderBatches();batchMessage.textContent='เปิดรายงานเดิมแล้ว';return}
+  const pdf=await loadPdfEngine();const doc=await pdf.getDocument({data:new Uint8Array(bytes),isEvalSupported:false,useSystemFonts:true}).promise;
+  let batch;try{const first=await (await doc.getPage(1)).getTextContent();
+   if(!first.items.some(item=>item.str?.includes('POS019'))){await oldUpload.call(this,e);return}
+   batch=await readPOS019(doc);
+  }finally{await doc.destroy()}
+  if(!/^2026-11-(0[1-9]|[12]\d|30)$/.test(batch.date))throw Error('ไฟล์พาร์นี้รองรับ พ.ย. 2026');
+  if(edits.pos019?.[batch.date])throw Error('พบรายงานอีกไฟล์ของวันที่นี้แล้ว กรุณาตรวจฉบับเดิมก่อน');
+  if(typeof offlinePDF==='undefined'){
+   const response=await api('/api/pos019-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({original:await new Promise((ok,fail)=>{const r=new FileReader();r.onload=()=>ok(r.result);r.onerror=fail;r.readAsDataURL(file)}),batch})});
+   const review=await response.json();if(!response.ok)throw Error(review.error||'OpenAI ตรวจ PDF ไม่สำเร็จ');batch.notes.push(...review.issues);
+  }else batch.notes.push('รุ่นทดลองบนเครื่อง • ยังไม่ได้ตรวจด้วย OpenAI');
+  Object.assign(batch,{file:file.name,hash,routes:{},posted:{}});
+  selectedBatch=batch.date;await saveBatch(()=>{edits.pos019??={};edits.pos019[batch.date]=batch});
+  batchMessage.textContent='เก็บรายงานแล้ว เลือกจุดขายเพื่อดูรายการ';
+ }catch(error){batchMessage.textContent=error.message}finally{this.value='';main.inert=false}
+};
+
+$('salesFile').closest('.panel').querySelector('p').textContent='อัปโหลด POS019 ทั้งวัน 1 ไฟล์เพื่อแยกยอดตามจุดขายและตรวจ Qty รวมทุกแก้วในแพ็กเกจ';
